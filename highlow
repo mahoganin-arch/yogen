@@ -1,0 +1,307 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © mahoga2
+
+//@version=6
+indicator("日経先物 - 4銘柄シグナル相関分析", overlay=true, max_bars_back=5000)
+
+// ═══════════════════════════════════════════════════════════
+// 設定
+// ═══════════════════════════════════════════════════════════
+showDebug = input.bool(true, "デバッグ", group="デバッグ")
+showStats = input.bool(true, "統計表示", group="表示")
+statsPos = input.string("右上", "統計位置", options=["右上", "右下", "左上", "左下"], group="表示")
+minOcc = input.int(3, "最小出現回数", minval=1, group="フィルター")
+
+// ═══════════════════════════════════════════════════════════
+// ヘルパー
+// ═══════════════════════════════════════════════════════════
+f_getInt(m, k) => 
+    v = map.get(m, k)
+    na(v) ? 0 : int(v)
+
+f_getFloat(m, k) => 
+    v = map.get(m, k)
+    na(v) ? 0.0 : float(v)
+
+// 銘柄リスト
+tickers = array.from("NI225", "TOPIX", "SPX", "NDX")
+ticker_names = array.from("日経225", "TOPIX", "SP500", "NASDAQ")
+ticker_ids = array.from("TVC:NI225", "TSE:TOPIX", "TVC:SPX", "NASDAQ:NDX")
+
+// ═══════════════════════════════════════════════════════════
+// 統計マップ
+// ═══════════════════════════════════════════════════════════
+var map<string, int> stat_count = map.new<string, int>()
+var map<string, int> stat_high_first = map.new<string, int>()
+var map<string, int> stat_low_first = map.new<string, int>()
+var map<string, float> stat_high_bars = map.new<string, float>()
+var map<string, float> stat_low_bars = map.new<string, float>()
+
+// ═══════════════════════════════════════════════════════════
+// シグナル判定関数
+// ═══════════════════════════════════════════════════════════
+f_get_signal(ticker_id) =>
+    // 前日確定の日足データ
+    [d_o, d_h, d_l, d_c] = request.security(ticker_id, "D", [open[1], high[1], low[1], close[1]], lookahead=barmerge.lookahead_off)
+    [d_o2, d_h2, d_l2, d_c2] = request.security(ticker_id, "D", [open[2], high[2], low[2], close[2]], lookahead=barmerge.lookahead_off)
+    
+    // シグナル計算
+    body = math.abs(d_c - d_o)
+    upper = d_h - math.max(d_c, d_o)
+    lower = math.min(d_c, d_o) - d_l
+    body2 = math.abs(d_c2 - d_o2)
+    upper2 = d_h2 - math.max(d_c2, d_o2)
+    lower2 = math.min(d_c2, d_o2) - d_l2
+    
+    bull = d_c > d_o
+    bear = d_c < d_o
+    bull2 = d_c2 > d_o2
+    bear2 = d_c2 < d_o2
+    
+    top = bull ? d_c : d_o
+    bot = bull ? d_o : d_c
+    top2 = bull2 ? d_c2 : d_o2
+    bot2 = bull2 ? d_o2 : d_c2
+    
+    s_spike_h = upper >= body * 3 and body > 0 and not (lower >= body * 3)
+    s_spike_l = lower >= body * 3 and body > 0 and not (upper >= body * 3)
+    s_bear_eng = bull2 and bear and top >= top2 and bot <= bot2
+    s_bull_eng = bear2 and bull and top >= top2 and bot <= bot2
+    s_bear_har = bull2 and bear and top <= top2 and bot >= bot2
+    s_bull_har = bear2 and bull and top <= top2 and bot >= bot2
+    s_up_wick = upper > lower and not s_spike_h
+    s_lo_wick = lower > upper and not s_spike_l
+    
+    sig = s_spike_h ? "■" : s_spike_l ? "□" : s_bear_eng ? "●" : s_bull_eng ? "○" : s_bear_har ? "◆" : s_bull_har ? "◇" : s_up_wick ? "↓" : s_lo_wick ? "↑" : ""
+    sig
+
+// ═══════════════════════════════════════════════════════════
+// 日経先物の日足確定判定
+// ═══════════════════════════════════════════════════════════
+daily_bar_index = request.security(syminfo.tickerid, "D", bar_index, lookahead=barmerge.lookahead_off)
+var int prev_daily_bar = -1
+daily_confirmed = daily_bar_index != prev_daily_bar and prev_daily_bar != -1
+
+if daily_bar_index != prev_daily_bar
+    prev_daily_bar := daily_bar_index
+
+// ═══════════════════════════════════════════════════════════
+// セッション管理（日経先物）
+// ═══════════════════════════════════════════════════════════
+var bool start_next_bar = false
+var array<string> active_signals = array.new<string>()  // 有効なシグナルキーのリスト
+var int session_start_bar_index = 0
+
+var float sess_entry = na
+var float sess_high = na
+var float sess_low = na
+var int sess_bars = 0
+var int high_bar_num = 0
+var int low_bar_num = 0
+
+var int count_start = 0
+var int count_end = 0
+var int count_record = 0
+
+// デバッグ用：現在の4銘柄シグナル
+var string debug_ni225_sig = ""
+var string debug_topix_sig = ""
+var string debug_spx_sig = ""
+var string debug_ndx_sig = ""
+
+// 日足確定時：4銘柄のシグナルを取得し、セッション開始を予約
+if daily_confirmed
+    // 前セッションの統計記録
+    if array.size(active_signals) > 0
+        high_first = high_bar_num < low_bar_num
+        low_first = low_bar_num < high_bar_num
+        
+        // 全ての有効なシグナルに対して統計記録
+        for i = 0 to array.size(active_signals) - 1
+            stat_key = array.get(active_signals, i)
+            
+            count_record += 1
+            map.put(stat_count, stat_key, f_getInt(stat_count, stat_key) + 1)
+            
+            if high_first
+                map.put(stat_high_first, stat_key, f_getInt(stat_high_first, stat_key) + 1)
+                map.put(stat_high_bars, stat_key, f_getFloat(stat_high_bars, stat_key) + high_bar_num)
+                map.put(stat_low_bars, stat_key, f_getFloat(stat_low_bars, stat_key) + low_bar_num)
+            else if low_first
+                map.put(stat_low_first, stat_key, f_getInt(stat_low_first, stat_key) + 1)
+                map.put(stat_high_bars, stat_key, f_getFloat(stat_high_bars, stat_key) + high_bar_num)
+                map.put(stat_low_bars, stat_key, f_getFloat(stat_low_bars, stat_key) + low_bar_num)
+        
+        count_end += 1
+    
+    // 4銘柄のシグナルを取得
+    array.clear(active_signals)
+    
+    for i = 0 to array.size(ticker_ids) - 1
+        ticker_id = array.get(ticker_ids, i)
+        ticker_code = array.get(tickers, i)
+        sig = f_get_signal(ticker_id)
+        
+        // デバッグ用に保存
+        if ticker_code == "NI225"
+            debug_ni225_sig := sig
+        else if ticker_code == "TOPIX"
+            debug_topix_sig := sig
+        else if ticker_code == "SPX"
+            debug_spx_sig := sig
+        else if ticker_code == "NDX"
+            debug_ndx_sig := sig
+        
+        // シグナルがあれば記録
+        if sig != ""
+            stat_key = ticker_code + "_" + sig
+            array.push(active_signals, stat_key)
+    
+    // シグナルがあればセッション開始を予約
+    if array.size(active_signals) > 0
+        start_next_bar := true
+
+// セッション開始処理
+if start_next_bar and not daily_confirmed
+    sess_entry := open
+    sess_high := high
+    sess_low := low
+    sess_bars := 1
+    high_bar_num := 1
+    low_bar_num := 1
+    session_start_bar_index := bar_index
+    count_start += 1
+    
+    // ラベル表示（全シグナルを表示）
+    label_text = "開始:\n"
+    for i = 0 to array.size(active_signals) - 1
+        label_text += array.get(active_signals, i) + "\n"
+    label.new(bar_index, high, label_text, style=label.style_label_down, color=color.new(color.blue, 30), textcolor=color.white, size=size.small)
+    
+    start_next_bar := false
+
+// セッション中の追跡（日経先物）
+if array.size(active_signals) > 0 and bar_index > session_start_bar_index
+    sess_bars += 1
+    
+    // 最高値更新
+    if high > sess_high
+        sess_high := high
+        high_bar_num := sess_bars
+    
+    // 最安値更新
+    if low < sess_low
+        sess_low := low
+        low_bar_num := sess_bars
+
+// ═══════════════════════════════════════════════════════════
+// デバッグ表示
+// ═══════════════════════════════════════════════════════════
+if showDebug and barstate.islast
+    var table dt = table.new(position.bottom_left, 2, 20, border_width=1, border_color=color.yellow)
+    
+    table.cell(dt, 0, 0, "デバッグ", bgcolor=color.new(color.yellow, 50), text_color=color.black)
+    table.cell(dt, 1, 0, "値", bgcolor=color.new(color.yellow, 50), text_color=color.black)
+    
+    table.cell(dt, 0, 1, "追跡対象", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 1, syminfo.ticker + " (日経先物)", text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 2, "日足確定", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 2, daily_confirmed ? "YES" : "NO", text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 3, "次の足で開始", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 3, start_next_bar ? "YES" : "NO", text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 4, "日経225シグナル", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 4, debug_ni225_sig != "" ? debug_ni225_sig : "なし", text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 5, "TOPIXシグナル", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 5, debug_topix_sig != "" ? debug_topix_sig : "なし", text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 6, "SP500シグナル", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 6, debug_spx_sig != "" ? debug_spx_sig : "なし", text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 7, "NASDAQシグナル", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 7, debug_ndx_sig != "" ? debug_ndx_sig : "なし", text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 8, "有効シグナル数", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 8, str.tostring(array.size(active_signals)), text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 9, "開始回数", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 9, str.tostring(count_start), text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 10, "終了回数", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 10, str.tostring(count_end), text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 11, "記録回数", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 11, str.tostring(count_record), text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 12, "セッションバー", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 12, str.tostring(sess_bars), text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 13, "開始価格", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 13, not na(sess_entry) ? str.tostring(sess_entry, "#.#") : "なし", text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 14, "セッション高値", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 14, not na(sess_high) ? str.tostring(sess_high, "#.#") : "なし", text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 15, "セッション安値", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 15, not na(sess_low) ? str.tostring(sess_low, "#.#") : "なし", text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 16, "高値バー番号", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 16, str.tostring(high_bar_num), text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 17, "安値バー番号", text_color=color.white, text_size=size.small)
+    table.cell(dt, 1, 17, str.tostring(low_bar_num), text_color=color.white, text_size=size.small)
+    
+    table.cell(dt, 0, 18, "高値先行", text_color=color.white, text_size=size.small)
+    high_first_debug = high_bar_num < low_bar_num
+    table.cell(dt, 1, 18, high_first_debug ? "YES" : "NO", text_color=color.white, text_size=size.small)
+
+// ═══════════════════════════════════════════════════════════
+// 統計テーブル（4銘柄 × 8シグナル → 日経先物の動き）
+// ═══════════════════════════════════════════════════════════
+if showStats and barstate.islast
+    pos = statsPos == "右上" ? position.top_right : statsPos == "右下" ? position.bottom_right : statsPos == "左上" ? position.top_left : position.bottom_left
+    
+    var table st = table.new(pos, 7, 50, border_width=1, border_color=color.gray)
+    
+    table.cell(st, 0, 0, "銘柄", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    table.cell(st, 1, 0, "シグナル", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    table.cell(st, 2, 0, "回数", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    table.cell(st, 3, 0, "高値先行率", bgcolor=color.new(color.red, 80), text_color=color.white, text_size=size.small)
+    table.cell(st, 4, 0, "高値平均", bgcolor=color.new(color.red, 80), text_color=color.white, text_size=size.small)
+    table.cell(st, 5, 0, "安値先行率", bgcolor=color.new(color.green, 80), text_color=color.white, text_size=size.small)
+    table.cell(st, 6, 0, "安値平均", bgcolor=color.new(color.green, 80), text_color=color.white, text_size=size.small)
+    
+    sigs = array.from("■", "●", "◆", "↓", "□", "○", "◇", "↑")
+    r = 1
+    
+    for t = 0 to array.size(tickers) - 1
+        ticker_code = array.get(tickers, t)
+        ticker_display = array.get(ticker_names, t)
+        
+        for s = 0 to array.size(sigs) - 1
+            sg = array.get(sigs, s)
+            stat_key = ticker_code + "_" + sg
+            cnt = f_getInt(stat_count, stat_key)
+            
+            if cnt >= minOcc
+                hf = f_getInt(stat_high_first, stat_key)
+                lf = f_getInt(stat_low_first, stat_key)
+                hsum = f_getFloat(stat_high_bars, stat_key)
+                lsum = f_getFloat(stat_low_bars, stat_key)
+                
+                hrate = cnt > 0 ? hf / cnt * 100 : 0
+                lrate = cnt > 0 ? lf / cnt * 100 : 0
+                havg = cnt > 0 ? hsum / cnt : 0
+                lavg = cnt > 0 ? lsum / cnt : 0
+                
+                table.cell(st, 0, r, ticker_display, text_color=color.white, text_size=size.small)
+                table.cell(st, 1, r, sg, text_color=color.white, text_size=size.small)
+                table.cell(st, 2, r, str.tostring(cnt), text_color=color.white, text_size=size.small)
+                table.cell(st, 3, r, str.tostring(hrate, "#.#") + "%", bgcolor=hrate > 50 ? color.new(color.red, 70) : color.new(color.gray, 90), text_color=color.white, text_size=size.small)
+                table.cell(st, 4, r, str.tostring(havg, "#.#") + "本", text_color=color.white, text_size=size.small)
+                table.cell(st, 5, r, str.tostring(lrate, "#.#") + "%", bgcolor=lrate > 50 ? color.new(color.green, 70) : color.new(color.gray, 90), text_color=color.white, text_size=size.small)
+                table.cell(st, 6, r, str.tostring(lavg, "#.#") + "本", text_color=color.white, text_size=size.small)
+                r += 1
